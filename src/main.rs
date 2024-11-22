@@ -1,8 +1,11 @@
+use context::generate_context_aware_prompt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{dup2, execvp, fork, ForkResult};
 use nix::{libc, pty::*};
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::CString;
 use std::io::{self, Read, Write};
@@ -13,6 +16,24 @@ use std::thread;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::{self, raw::IntoRawMode};
+
+mod context;
+
+#[derive(Debug, Deserialize)]
+struct Flag {
+    name: String,
+    placeholder: String,
+    optional: bool,
+    default: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandSchema {
+    bin: String,
+    subcommand: Option<String>,
+    action: Option<String>,
+    flags: Vec<Flag>,
+}
 
 fn main() {
     // Set up the PTY
@@ -123,165 +144,192 @@ fn main() {
     }
 }
 
-fn prompt_for_command<W: Write>(stdout: &mut W, master_fd_raw: RawFd) {
-    let (_cols, rows) = termion::terminal_size().unwrap_or((80, 24));
+fn validate_command_schema(schema: &CommandSchema) -> Result<(), String> {
+    if schema.bin.is_empty() {
+        return Err("The `bin` field is required.".to_string());
+    }
+    for flag in &schema.flags {
+        if flag.name.is_empty() {
+            return Err("Each flag must have a `name`.".to_string());
+        }
+        if !flag.optional && flag.default.is_none() && flag.placeholder.is_empty() {
+            return Err(format!(
+                "Flag '{}' is required but does not have a placeholder or default value.",
+                flag.name
+            ));
+        }
+    }
+    Ok(())
+}
 
-    write!(stdout, "{}", termion::cursor::Save).unwrap();
-    stdout.flush().unwrap();
+fn parse_command(
+    schema: CommandSchema,
+    user_inputs: &HashMap<String, String>,
+) -> Result<String, String> {
+    // Validate schema
+    validate_command_schema(&schema)?;
 
-    write!(stdout, "{}", termion::cursor::Goto(1, rows - 1)).unwrap();
-    write!(stdout, ":").unwrap();
-    stdout.flush().unwrap();
+    // Build the command
+    let mut command = schema.bin.clone();
+    if let Some(subcommand) = schema.subcommand {
+        command.push(' ');
+        command.push_str(&subcommand);
+    }
+    if let Some(action) = schema.action {
+        command.push(' ');
+        command.push_str(&action);
+    }
 
-    let stdin = io::stdin();
-    let mut input = String::new();
-
-    {
-        let stdin_lock = stdin.lock();
-        for c in stdin_lock.keys() {
-            match c.unwrap() {
-                Key::Char('\n') | Key::Char('\r') => {
-                    break;
-                }
-                Key::Char('\x7f') | Key::Backspace => {
-                    if !input.is_empty() {
-                        input.pop();
-                        write!(stdout, "\x08 \x08").unwrap();
-                        stdout.flush().unwrap();
-                    }
-                }
-                Key::Char(ch) => {
-                    input.push(ch);
-                    write!(stdout, "{}", ch).unwrap();
-                    stdout.flush().unwrap();
-                }
-                Key::Ctrl('c') => {
-                    input.clear();
-                    break;
-                }
-                _ => {}
+    // Add flags
+    for flag in schema.flags {
+        if let Some(user_value) = user_inputs.get(&flag.placeholder) {
+            // Add the flag and user-provided value
+            command.push(' ');
+            command.push_str(&flag.name);
+            command.push(' ');
+            command.push_str(user_value);
+        } else if !flag.optional {
+            // Add default value if available
+            if let Some(default_value) = flag.default {
+                command.push(' ');
+                command.push_str(&flag.name);
+                command.push(' ');
+                command.push_str(&default_value);
+            } else {
+                return Err(format!("Missing required parameter: {}", flag.placeholder));
             }
         }
     }
 
-    write!(
-        stdout,
-        "{}{}",
-        termion::clear::CurrentLine,
-        termion::cursor::Restore
-    )
-    .unwrap();
-    stdout.flush().unwrap();
+    Ok(command.trim().to_string())
+}
 
-    if input.is_empty() {
-        return;
+fn read_user_input<W: Write>(stdin: &io::Stdin, stdout: &mut W) -> String {
+    let mut input = String::new();
+    let stdin_lock = stdin.lock();
+
+    for c in stdin_lock.keys() {
+        match c.unwrap() {
+            Key::Char('\n') | Key::Char('\r') => break,
+            Key::Char('\x7f') | Key::Backspace => {
+                if !input.is_empty() {
+                    input.pop();
+                    write!(stdout, "\x08 \x08").unwrap();
+                    stdout.flush().unwrap();
+                }
+            }
+            Key::Char(ch) => {
+                input.push(ch);
+                write!(stdout, "{}", ch).unwrap();
+                stdout.flush().unwrap();
+            }
+            Key::Ctrl('c') => {
+                input.clear();
+                break;
+            }
+            _ => {}
+        }
     }
 
-    let raw_command = get_command_from_chatgpt(&input);
+    input
+}
 
-    // Clean the GPT command
-    let command_with_placeholders = clean_gpt_command(&raw_command);
+fn display_command_preview<W: Write>(stdout: &mut W, schema: &CommandSchema, rows: u16) {
+    let preview = format!(
+        "{} {} {}",
+        schema.bin,
+        schema.subcommand.clone().unwrap_or_default(),
+        schema.action.clone().unwrap_or_default()
+    );
 
-    // Display the cleaned command with placeholders above the prompts
     write!(
         stdout,
         "{}Command: {}\n",
         termion::cursor::Goto(1, rows - 3),
-        command_with_placeholders
+        preview
     )
     .unwrap();
     stdout.flush().unwrap();
+}
 
-    // Find placeholders using regex
-    let placeholder_regex = Regex::new(r"<(\w+)(?::([^>]+))?>").unwrap();
+fn gather_user_inputs<W: Write>(
+    stdout: &mut W,
+    stdin: io::Stdin,
+    schema: &CommandSchema,
+    rows: u16,
+) -> HashMap<String, String> {
+    let mut user_inputs = HashMap::new();
 
-    let mut filled_command = command_with_placeholders.clone();
-
-    for cap in placeholder_regex.captures_iter(&command_with_placeholders) {
-        let param_name = &cap[1];
-        let default_value = cap.get(2).map_or("", |m| m.as_str());
-
-        // Prompt user to fill in the parameter
-        if default_value.is_empty() {
-            // Mandatory input since no default is provided
-            write!(
-                stdout,
-                "{}{}{} (required): ",
-                termion::cursor::Goto(1, rows - 2),
-                termion::clear::CurrentLine,
-                param_name
-            )
-            .unwrap();
+    for flag in &schema.flags {
+        let prompt_message = if flag.optional {
+            format!("{} (optional): ", flag.placeholder)
         } else {
-            // Optional input with default
-            write!(
-                stdout,
-                "{}{}{} (default: {}): ",
-                termion::cursor::Goto(1, rows - 2),
-                termion::clear::CurrentLine,
-                param_name,
-                default_value
-            )
-            .unwrap();
-        }
-        stdout.flush().unwrap();
-
-        let mut user_input = String::new();
-        let stdin_lock = stdin.lock();
-        for c in stdin_lock.keys() {
-            match c.unwrap() {
-                Key::Char('\n') | Key::Char('\r') => {
-                    break;
-                }
-                Key::Char('\x7f') | Key::Backspace => {
-                    if !user_input.is_empty() {
-                        user_input.pop();
-                        write!(stdout, "\x08 \x08").unwrap();
-                        stdout.flush().unwrap();
-                    }
-                }
-                Key::Char(ch) => {
-                    user_input.push(ch);
-                    write!(stdout, "{}", ch).unwrap();
-                    stdout.flush().unwrap();
-                }
-                Key::Ctrl('c') => {
-                    user_input.clear();
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        let final_value = if user_input.trim().is_empty() {
-            if default_value.is_empty() {
-                eprintln!("{} is required. Aborting.", param_name);
-                return;
-            } else {
-                default_value.to_string()
-            }
-        } else {
-            user_input.trim().to_string()
+            format!("{} (required): ", flag.placeholder)
         };
 
-        // Replace placeholder in command
-        filled_command = filled_command.replace(&cap[0], &final_value);
+        write!(
+            stdout,
+            "{}{}{}",
+            termion::cursor::Goto(1, rows - 2),
+            termion::clear::CurrentLine,
+            prompt_message
+        )
+        .unwrap();
+        stdout.flush().unwrap();
+
+        let input = read_user_input(&stdin, stdout);
+
+        // If the input is empty and the parameter is optional, skip it
+        if input.trim().is_empty() && flag.optional {
+            continue;
+        }
+
+        // If the input is non-empty or required, add it to the user inputs
+        if !input.trim().is_empty() || !flag.optional {
+            user_inputs.insert(flag.placeholder.clone(), input.trim().to_string());
+        }
     }
 
-    // Clear the parameter prompt line
-    write!(
-        stdout,
-        "{}{}",
-        termion::clear::CurrentLine,
-        termion::cursor::Restore
-    )
-    .unwrap();
-    stdout.flush().unwrap();
+    user_inputs
+}
 
-    // Send the completed command to the shell via PTY
+fn construct_command(schema: CommandSchema, user_inputs: &HashMap<String, String>) -> String {
+    let mut command = schema.bin.clone();
+    if let Some(subcommand) = schema.subcommand {
+        command.push(' ');
+        command.push_str(&subcommand);
+    }
+    if let Some(action) = schema.action {
+        command.push(' ');
+        command.push_str(&action);
+    }
+
+    for flag in schema.flags {
+        if let Some(value) = user_inputs.get(&flag.placeholder) {
+            // If user provided a value, include the flag and value
+            command.push(' ');
+            command.push_str(&flag.name);
+            command.push(' ');
+            command.push_str(value);
+        } else if !flag.optional {
+            // If required but not provided, use the default value
+            if let Some(default) = flag.default {
+                command.push(' ');
+                command.push_str(&flag.name);
+                command.push(' ');
+                command.push_str(&default);
+            }
+        }
+        // Skip the flag entirely if it's optional and no input was provided
+    }
+
+    command
+}
+
+fn send_to_shell(master_fd_raw: RawFd, command: &str) {
     let bracketed_paste_start = b"\x1b[200~";
     let bracketed_paste_end = b"\x1b[201~";
-    let command_bytes = filled_command.as_bytes();
+    let command_bytes = command.as_bytes();
     let mut full_command = Vec::new();
     full_command.extend_from_slice(bracketed_paste_start);
     full_command.extend_from_slice(command_bytes);
@@ -296,52 +344,76 @@ fn prompt_for_command<W: Write>(stdout: &mut W, master_fd_raw: RawFd) {
     }
 }
 
-fn clean_gpt_command(command: &str) -> String {
-    let trimmed = command.trim();
+fn prompt_for_command<W: Write>(stdout: &mut W, master_fd_raw: RawFd) {
+    let (_cols, rows) = termion::terminal_size().unwrap_or((80, 24));
+    let stdin = io::stdin();
 
-    // Check if the command starts and ends with backticks
-    if trimmed.starts_with("```") && trimmed.ends_with("```") {
-        // Remove the first and last lines
-        let lines: Vec<&str> = trimmed.lines().collect();
-        if lines.len() > 2 {
-            // Join all lines except the first and last
-            return lines[1..lines.len() - 1].join("\n").trim().to_string();
-        }
+    // Save cursor position to restore later
+    write!(stdout, "{}", termion::cursor::Save).unwrap();
+    stdout.flush().unwrap();
+
+    // Prompt for user input
+    write!(stdout, "{}", termion::cursor::Goto(1, rows - 1)).unwrap();
+    write!(stdout, ":").unwrap();
+    stdout.flush().unwrap();
+
+    let input = read_user_input(&stdin, stdout);
+
+    // Clear the input prompt
+    write!(
+        stdout,
+        "{}{}",
+        termion::clear::CurrentLine,
+        termion::cursor::Restore
+    )
+    .unwrap();
+    stdout.flush().unwrap();
+
+    if input.trim().is_empty() {
+        return; // No input provided
     }
 
-    // Return the command as-is if no markdown wrapper is found
-    trimmed.to_string()
+    // Get the raw command (JSON format) from ChatGPT
+    let schema = get_command_from_chatgpt(&input);
+
+    // Gather user input for placeholders
+    let user_inputs = gather_user_inputs(stdout, stdin, &schema, rows);
+
+    // Construct the final shell command
+    let final_command = construct_command(schema, &user_inputs);
+
+    // Restore cursor position before placing the command
+    write!(stdout, "{}", termion::cursor::Restore).unwrap();
+    stdout.flush().unwrap();
+
+    // Send the completed command to the shell via PTY
+    send_to_shell(master_fd_raw, &final_command);
 }
 
-fn get_command_from_chatgpt(prompt: &str) -> String {
+fn get_command_from_chatgpt(prompt: &str) -> CommandSchema {
     let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
 
     let client = reqwest::blocking::Client::new();
+
+    let message = generate_context_aware_prompt();
 
     let request_body = json!({
         "model": "gpt-4-turbo",
         "messages": [
             {
                 "role": "system",
-                "content": "You are an assistant that outputs only shell commands for macOS with Homebrew and Zsh. Use the following format for parameters in commands: \
-                - For mandatory parameters: <param_name> (e.g., <source>). \
-                - For mandatory parameters with a default value: <param_name:default_value> (e.g., <destination:/default/path>). \
-                "
+                "content": message
             },
             {
                 "role": "user",
                 "content": format!(
-                    "Generate the shell command to {}. Use <param_name>, <param_name:default_value> where appropriate. Only output the shell command without any explanation, markdown, or extra text.",
+                    "Generate the shell command to {}. Always respond strictly in JSON format, adhering to the schema provided.",
                     prompt
                 )
             }
         ],
-        "max_tokens": 100,
         "temperature": 0,
     });
-
-    // set git's default merge setting to rebase
-    // zip contents of a folder
 
     let res = client
         .post("https://api.openai.com/v1/chat/completions")
@@ -356,22 +428,28 @@ fn get_command_from_chatgpt(prompt: &str) -> String {
                     eprintln!("Failed to parse response JSON: {}", e);
                     std::process::exit(1);
                 });
-                let command = response_json["choices"][0]["message"]["content"]
+
+                // Extract the JSON content from the GPT response
+                let command_json = response_json["choices"][0]["message"]["content"]
                     .as_str()
                     .unwrap_or_else(|| {
                         eprintln!("Unexpected response format");
                         std::process::exit(1);
-                    })
-                    .trim();
-                command.to_string()
+                    });
+
+                // Deserialize the JSON response into CommandSchema
+                serde_json::from_str(command_json).unwrap_or_else(|e| {
+                    eprintln!("Failed to deserialize command JSON: {}", e);
+                    std::process::exit(1);
+                })
             } else {
                 eprintln!("API Error: {:?}", response.text());
-                "echo Error getting command from ChatGPT".to_string()
+                std::process::exit(1);
             }
         }
         Err(e) => {
             eprintln!("Request error: {}", e);
-            "echo Error getting command from ChatGPT".to_string()
+            std::process::exit(1);
         }
     }
 }
