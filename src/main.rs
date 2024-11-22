@@ -327,10 +327,12 @@ fn construct_command(schema: CommandSchema, user_inputs: &HashMap<String, String
 }
 
 fn send_to_shell(master_fd_raw: RawFd, command: &str) {
+    // Use bracketed paste to cleanly send the command
     let bracketed_paste_start = b"\x1b[200~";
     let bracketed_paste_end = b"\x1b[201~";
     let command_bytes = command.as_bytes();
     let mut full_command = Vec::new();
+
     full_command.extend_from_slice(bracketed_paste_start);
     full_command.extend_from_slice(command_bytes);
     full_command.extend_from_slice(bracketed_paste_end);
@@ -340,6 +342,15 @@ fn send_to_shell(master_fd_raw: RawFd, command: &str) {
             master_fd_raw,
             full_command.as_ptr() as *const libc::c_void,
             full_command.len(),
+        );
+    }
+
+    let cursor_move = format!("\x1b[{}", command.chars().count());
+    unsafe {
+        libc::write(
+            master_fd_raw,
+            cursor_move.as_ptr() as *const libc::c_void,
+            cursor_move.len(),
         );
     }
 }
@@ -384,6 +395,16 @@ fn prompt_for_command<W: Write>(stdout: &mut W, master_fd_raw: RawFd) {
 
     // Restore cursor position before placing the command
     write!(stdout, "{}", termion::cursor::Restore).unwrap();
+    stdout.flush().unwrap();
+
+    // Insert the command and move cursor to the end
+    write!(
+        stdout,
+        "{}{}",
+        final_command,
+        termion::cursor::Left(final_command.len() as u16)
+    )
+    .unwrap();
     stdout.flush().unwrap();
 
     // Send the completed command to the shell via PTY
